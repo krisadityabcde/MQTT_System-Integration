@@ -1,0 +1,24 @@
+{
+  "sensorThresholds": {
+    "temperature": {
+      "min": -10,
+      "max": 50
+    },
+    "humidity": {
+      "min": 0,
+      "max": 100
+    },
+    "pressure": {
+      "min": 950,
+      "max": 1050
+    }
+  },
+  "logging": {
+    "level": "info",
+    "logFile": "logs/weather_station.log"
+  },
+  "api": {
+    "port": 3000,
+    "basePath": "/api"
+  }
+}
