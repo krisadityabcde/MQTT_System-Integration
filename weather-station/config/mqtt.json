@@ -1,0 +1,45 @@
+{    "broker": {
+        "clientId": "weather-station-client",
+        "host": "7c6c6507383a4b57b5f73afe3a84a360.s1.eu.hivemq.cloud",
+        "port": 8883,
+        "protocol": "mqtts",
+        "username": "puro1",
+        "password": "PuroFuro1",
+        "rejectUnauthorized": true
+    },
+    "topics": {
+        "temperature": "weather/temperature",
+        "humidity": "weather/humidity",
+        "pressure": "weather/pressure",
+        "all": "weather/all",
+        "status": "weather/status",
+        "control": "weather/control",
+        "ping": "weather/ping",
+        "pong": "weather/pong",
+        "request": {
+            "reading": "weather/request/reading"
+        },
+        "response": {
+            "reading": "weather/response/reading"
+        }
+    },
+    "qos": {
+        "temperature": 0,
+        "humidity": 1,
+        "pressure": 2,
+        "status": 1,
+        "control": 1,
+        "ping": 1
+    },
+    "features": {
+        "secure": true,
+        "authentication": true,
+        "qos": true,
+        "retained": true,
+        "lastWill": true,
+        "messageExpiry": true,
+        "requestResponse": true,
+        "flowControl": true,
+        "pingPong": true
+    }
+}

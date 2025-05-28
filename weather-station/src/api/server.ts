@@ -27,12 +27,34 @@ export function startServer() {
     // Create sensor instances
     const temperatureSensor = new TemperatureSensor();
     const humiditySensor = new HumiditySensor();
-    const pressureSensor = new PressureSensor();    // Create an instance of MqttService
+    const pressureSensor = new PressureSensor();    // Create an instance of MqttService (connecting to HiveMQ Cloud)
     const mqttService = new MqttService({
         clientId: `weather-station-${Math.random().toString(16).substr(2, 8)}`,
-        host: 'localhost',
-        port: 1883,
-        protocol: 'mqtt'
+        // Using your HiveMQ Cloud cluster
+        host: '7c6c6507383a4b57b5f73afe3a84a360.s1.eu.hivemq.cloud',
+        port: 8883, // TLS port
+        protocol: 'mqtts', // Secure MQTT
+        username: 'puro1',
+        password: 'PuroFuro1',
+        // Secure connection settings for HiveMQ Cloud
+        rejectUnauthorized: true
+    });
+    
+    // Create a dedicated ping responder client to ensure there's always someone to respond
+    const pingResponderService = new MqttService({
+        clientId: `ping-responder-${Math.random().toString(16).substr(2, 8)}`,
+        host: '7c6c6507383a4b57b5f73afe3a84a360.s1.eu.hivemq.cloud',
+        port: 8883,
+        protocol: 'mqtts',
+        username: 'puro1',
+        password: 'PuroFuro1',
+        rejectUnauthorized: true
+    });
+    
+    // Set up ping responder
+    pingResponderService.getClient().on('connect', () => {
+        console.log('Ping responder connected to MQTT broker');
+        pingResponderService.subscribe('weather/ping', 1);
     });
     
     // Get the MQTT client from the service
@@ -67,7 +89,32 @@ export function startServer() {
 
     // Global interval for sending data
     let sensorDataInterval: NodeJS.Timeout | null = null;
-      function startDataBroadcast() {
+    
+    // Manual expiry simulation - remove retained messages after 5 seconds
+    let retainedMessageCleanup: Map<string, NodeJS.Timeout> = new Map();
+    
+    function simulateMessageExpiry(topic: string) {
+        // Clear any existing timeout for this topic
+        const existingTimeout = retainedMessageCleanup.get(topic);
+        if (existingTimeout) {
+            clearTimeout(existingTimeout);
+        }
+        
+        // Set new timeout to "expire" the message
+        const timeout = setTimeout(() => {
+            console.log(`Simulating expiry for topic: ${topic}`);
+            // Publish empty retained message to clear it
+            mqttService.publish(topic, '', {
+                qos: 1,
+                retain: true
+            });
+            retainedMessageCleanup.delete(topic);
+        }, 5000); // 5 seconds
+        
+        retainedMessageCleanup.set(topic, timeout);
+    }
+    
+    function startDataBroadcast() {
         if (!sensorDataInterval) {
             sensorDataInterval = setInterval(() => {
                 const temperature = temperatureSensor.readTemperature();
@@ -83,53 +130,78 @@ export function startServer() {
                 
                 console.log('Broadcasting sensor data:', allData);
                 
-                // Publish to MQTT with different QoS levels
                 // Temperature with QoS 0 (at most once) - not retained
                 mqttService.publish('weather/temperature', JSON.stringify(temperatureData), { 
                     qos: 0,
                     retain: false 
                 });
                 
-                // Humidity with QoS 1 (at least once) - retained
+                // Humidity with QoS 1 (at least once) - retained with simulated expiry
                 mqttService.publish('weather/humidity', JSON.stringify(humidityData), { 
                     qos: 1,
                     retain: true,
                     properties: {
-                        messageExpiryInterval: 3600 // 1 hour expiry
+                        messageExpiryInterval: 5 // This might not work on HiveMQ Cloud
                     }
                 });
+                simulateMessageExpiry('weather/humidity'); // Fallback manual expiry
                 
-                // Pressure with QoS 2 (exactly once) - retained
+                // Pressure with QoS 2 (exactly once) - retained with simulated expiry
                 mqttService.publish('weather/pressure', JSON.stringify(pressureData), { 
                     qos: 2,
                     retain: true,
                     properties: {
-                        messageExpiryInterval: 3600 // 1 hour expiry
+                        messageExpiryInterval: 5 // This might not work on HiveMQ Cloud
                     }
                 });
+                simulateMessageExpiry('weather/pressure'); // Fallback manual expiry
                 
                 // All data with QoS 1 - not retained
                 mqttService.publish('weather/all', JSON.stringify(allData), { 
                     qos: 1,
                     retain: false,
                     properties: {
-                        messageExpiryInterval: 300 // 5 minutes expiry
+                        messageExpiryInterval: 5
                     }
                 });
                 
                 // Broadcast to ALL connected clients via Socket.io
                 io.emit('sensorData', allData);
             }, 1000);
-            console.log("Started sensor data broadcast");
+            console.log("Started sensor data broadcast with message expiry simulation");
         }
     }
+    
+    // Set up MQTT service pong event forwarding to all connected clients
+    mqttService.on('pong', (pongData) => {
+        console.log(`Forwarding pong to clients: ${pongData.latency}ms`);
+        io.emit('mqtt-pong', pongData);
+    });
+      mqttService.on('ping-timeout', (timeoutData) => {
+        console.log(`Forwarding ping timeout to clients: ${timeoutData.correlationId}`);
+        io.emit('mqtt-ping-timeout', timeoutData);
+    });
 
-    // Handle socket connections
+    // Handle socket connections - CONSOLIDATED HANDLER
     io.on('connection', (socket) => {
         console.log('Client connected to dashboard');
         
         // Start broadcasting if not already started
         startDataBroadcast();
+        
+        // Handle ping-pong requests from the client
+        socket.on('mqttPing', () => {
+            console.log('Received ping request from client');
+            
+            // Send ping using the MQTT service
+            mqttService.sendPing();
+        });
+        
+        // Handle ping timeout reset requests
+        socket.on('resetPingButton', () => {
+            console.log('Received ping button reset request from client');
+            // This is handled on the client side, just log for debugging
+        });
         
         // Clean up on disconnect
         socket.on('disconnect', () => {
@@ -143,50 +215,18 @@ export function startServer() {
                 }
             }
         });
-    });    // Handle MQTT messages
+    });// Handle MQTT messages
     mqttClient.on('message', (topic, message, packet) => {
         console.log(`Received message from ${topic}: ${message.toString()}`);
-        console.log(`Message properties: QoS=${packet.qos}, Retained=${packet.retain}`);
         
         try {
             const data = JSON.parse(message.toString());
             
-            // Add metadata to the message for UI display
-            const enhancedData = {
-                ...data,
-                _meta: {
-                    topic,
-                    qos: packet.qos,
-                    retained: packet.retain,
-                    receivedAt: new Date().toISOString()
-                }
-            };
-            
             // Handle different topics
             switch(topic) {
                 case 'weather/all':
-                    io.emit('sensorData', enhancedData);
+                    io.emit('sensorData', data);
                     console.log('Forwarded combined sensor data to clients');
-                    break;
-                    
-                case 'weather/temperature':
-                    io.emit('temperatureData', enhancedData);
-                    console.log('Forwarded temperature data to clients');
-                    break;
-                    
-                case 'weather/humidity':
-                    io.emit('humidityData', enhancedData);
-                    console.log('Forwarded humidity data to clients');
-                    break;
-                    
-                case 'weather/pressure':
-                    io.emit('pressureData', enhancedData);
-                    console.log('Forwarded pressure data to clients');
-                    break;
-                    
-                case 'weather/status':
-                    io.emit('stationStatus', enhancedData);
-                    console.log('Forwarded station status to clients');
                     break;
                     
                 case 'weather/control':
@@ -197,7 +237,6 @@ export function startServer() {
                             clearInterval(sensorDataInterval);
                             sensorDataInterval = null;
                             
-                            // Acknowledge the pause command
                             mqttService.publish('weather/control/ack', JSON.stringify({
                                 status: 'paused',
                                 timestamp: new Date().toISOString()
@@ -207,19 +246,8 @@ export function startServer() {
                         console.log('Received resume command');
                         startDataBroadcast();
                         
-                        // Acknowledge the resume command
                         mqttService.publish('weather/control/ack', JSON.stringify({
                             status: 'resumed',
-                            timestamp: new Date().toISOString()
-                        }), { qos: 1 });
-                    } else if (data.action === 'setRate') {
-                        // Implement flow control by adjusting the rate
-                        console.log(`Adjusting message rate to ${data.messagesPerSecond} per second`);
-                        
-                        // Acknowledge the rate change
-                        mqttService.publish('weather/control/ack', JSON.stringify({
-                            status: 'rateChanged',
-                            rate: data.messagesPerSecond,
                             timestamp: new Date().toISOString()
                         }), { qos: 1 });
                     }
@@ -228,52 +256,34 @@ export function startServer() {
         } catch (err) {
             console.error('Error handling MQTT message:', err);
         }
-    });    // Set up demo for request-response pattern
-    // This simulates a client requesting data at a specific interval
-    const requestResponseDemo = setInterval(async () => {
+    });
+    
+    // Add API endpoint to test message expiry
+    app.get('/api/test-expiry', async (req, res) => {
         try {
-            console.log("Demonstrating request-response pattern for on-demand reading");
+            console.log('Testing message expiry...');
             
-            // Make a request for current weather data
-            const response = await mqttService.request(
-                'weather/request/reading', // Request topic
-                'weather/response/reading', // Response topic
-                { requestId: `req-${Date.now()}`, type: 'fullReading' }, // Payload
-                5000 // Timeout in ms
-            );
-            
-            console.log('Received response to on-demand reading request:', response);
-            
-            // Notify clients of the on-demand reading
-            io.emit('onDemandReading', {
-                ...response,
-                _meta: {
-                    type: 'requestResponse',
-                    requestTime: new Date().toISOString()
+            // Publish a test message with expiry
+            mqttService.publish('weather/test-expiry', JSON.stringify({
+                message: 'This should expire in 5 seconds',
+                timestamp: new Date().toISOString()
+            }), {
+                qos: 1,
+                retain: true,
+                properties: {
+                    messageExpiryInterval: 5
                 }
             });
-        } catch (err) {
-            console.error('Error in request-response demo:', err);
-        }
-    }, 10000); // Every 10 seconds
-    
-    // Add an API endpoint to trigger on-demand readings
-    app.get('/api/request-reading', async (req, res) => {
-        try {
-            const response = await mqttService.request(
-                'weather/request/reading',
-                'weather/response/reading',
-                { 
-                    requestId: `api-req-${Date.now()}`,
-                    type: 'fullReading',
-                    source: 'api'
-                },
-                5000
-            );
             
             res.json({
                 success: true,
-                data: response
+                message: 'Test message published with 5-second expiry. Check HiveMQ webclient in 10 seconds.',
+                instructions: [
+                    '1. Go to HiveMQ Cloud webclient',
+                    '2. Subscribe to topic: weather/test-expiry',
+                    '3. Wait 10 seconds after this request',
+                    '4. Connect a new client and subscribe - should NOT receive retained message'
+                ]
             });
         } catch (err) {
             res.status(500).json({
@@ -281,6 +291,19 @@ export function startServer() {
                 error: err instanceof Error ? err.message : String(err)
             });
         }
+    });
+    
+    // Add endpoint to check MQTT client capabilities
+    app.get('/api/mqtt-info', (req, res) => {
+        const client = mqttService.getClient();
+        res.json({
+            clientId: client.options.clientId,
+            protocolVersion: client.options.protocolVersion,
+            connected: client.connected,
+            brokerUrl: `${client.options.protocol}://${client.options.host}:${client.options.port}`,
+            supportsProperties: !!client.options.properties,
+            note: 'Message expiry requires MQTT 5.0 support from both client and broker'
+        });
     });
     
     // Graceful shutdown function to handle MQTT cleanup
@@ -291,12 +314,14 @@ export function startServer() {
         if (sensorDataInterval) {
             clearInterval(sensorDataInterval);
         }
-        if (requestResponseDemo) {
-            clearInterval(requestResponseDemo);
-        }
         
-        // Disconnect MQTT with Last Will and Testament
+        // Clear expiry timeouts
+        retainedMessageCleanup.forEach(timeout => clearTimeout(timeout));
+        retainedMessageCleanup.clear();
+        
+        // Disconnect MQTT services
         mqttService.disconnect();
+        pingResponderService.disconnect();
         
         process.exit(0);
     }
