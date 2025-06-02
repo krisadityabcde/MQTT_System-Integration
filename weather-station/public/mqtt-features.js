@@ -108,7 +108,7 @@ function setupPingPong() {
     setupSocketListeners();
 }
 
-// Initialize ping-pong when DOM is loaded
+// Initialize ping-pong functionality when DOM is loaded
 document.addEventListener('DOMContentLoaded', function() {
     setTimeout(() => {
         setupPingPong();

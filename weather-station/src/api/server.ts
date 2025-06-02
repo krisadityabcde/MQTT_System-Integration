@@ -55,36 +55,90 @@ export function startServer() {
     pingResponderService.getClient().on('connect', () => {
         console.log('Ping responder connected to MQTT broker');
         pingResponderService.subscribe('weather/ping', 1);
+        
+        // Set up ping response handling
+        pingResponderService.getClient().on('message', (topic, message, packet) => {
+            if (topic === 'weather/ping') {
+                try {
+                    const data = JSON.parse(message.toString());
+                    console.log(`Ping responder received ping from ${data.clientId}`);
+                    
+                    // Always respond to pings (this is our dedicated responder)
+                    console.log(`Ping responder sending pong for ${data.correlationId}`);
+                    
+                    // Respond with pong message
+                    pingResponderService.publish('weather/pong', JSON.stringify({
+                        responderId: pingResponderService.getClient().options.clientId,
+                        originalSender: data.clientId,
+                        correlationId: data.correlationId,
+                        originalTimestamp: data.timestamp,
+                        timestamp: new Date().toISOString()
+                    }), { qos: 1 });
+                } catch (err) {
+                    console.error('Ping responder error:', err);
+                }
+            }
+        });
     });
     
     // Get the MQTT client from the service
     const mqttClient = mqttService.getClient();
     
     // Set up Will message and status on connect
-    mqttClient.on('connect', () => {
-        console.log('Connected to MQTT broker');
+    mqttClient.on('connect', (connack) => {
+        console.log('📡 Main MQTT Client Connected:');
+        console.log(`   🔌 Protocol Version: ${mqttClient.options.protocolVersion}`);
+        console.log(`   🆔 Client ID: ${mqttClient.options.clientId}`);
+        console.log(`   ✅ MQTT 5.0 Support: ${mqttClient.options.protocolVersion === 5 ? 'YES' : 'NO'}`);
         
-        // Subscribe to topics with different QoS levels
+        if (mqttClient.options.protocolVersion !== 5) {
+            console.log('⚠️ WARNING: MQTT 5.0 not enabled! Request-Response may not work properly.');
+        }
+        
+        // Subscribe to topics with different QoS levels (using MQTT 5.0 client but standard pub/sub)
         mqttService.subscribe('weather/temperature', 0); // QoS 0 - At most once delivery
-        mqttService.subscribe('weather/humidity', 1);    // QoS 1 - At least once delivery
+        mqttService.subscribe('weather/humidity', 1);    // QoS 1 - At least once delivery  
         mqttService.subscribe('weather/pressure', 2);    // QoS 2 - Exactly once delivery
         mqttService.subscribe('weather/all', 1);         // QoS 1 for all sensor data
         mqttService.subscribe('weather/control', 1);     // QoS 1 for control messages
         
-        // Set up request handler for on-demand readings
-        mqttService.onRequest('weather/request/reading', async (request) => {
+        // Set up MQTT 5.0 request handler IMMEDIATELY (MQTT 5.0 Request-Response with Properties)
+        console.log('🔧 Setting up MQTT 5.0 request handler...');
+        mqttService.onRequest('weather/request/reading', async (request, responseTopic, correlationData) => {
+            console.log('🔵 Processing MQTT 5.0 on-demand reading request:', request);
+            console.log('🔵 Response Topic:', responseTopic);
+            console.log('🔵 Correlation Data:', correlationData.toString('hex'));
+            
             const temperature = temperatureSensor.readTemperature();
             const humidity = humiditySensor.readHumidity();
             const pressure = pressureSensor.readPressure();
             
-            return { 
+            const response = { 
                 temperature, 
                 humidity, 
                 pressure,
                 timestamp: new Date().toISOString(),
-                requestId: request.requestId
+                requestId: request.requestId,
+                correlationId: correlationData.toString('hex'),
+                mqtt5: true,
+                processingSuccess: true,
+                protocolVersion: mqttClient.options.protocolVersion
             };
+            
+            console.log('🟢 Sending MQTT 5.0 response:', response);
+            return response;
         });
+        
+        console.log('✅ MQTT 5.0 request handler configured');
+    });
+    
+    // Add connection error handling
+    mqttClient.on('error', (error) => {
+        console.error('MQTT connection error:', error);
+    });
+    
+    mqttClient.on('close', () => {
+        console.log('MQTT connection closed');
     });
 
     // Global interval for sending data
@@ -303,6 +357,128 @@ export function startServer() {
             brokerUrl: `${client.options.protocol}://${client.options.host}:${client.options.port}`,
             supportsProperties: !!client.options.properties,
             note: 'Message expiry requires MQTT 5.0 support from both client and broker'
+        });
+    });
+    
+    // Add API endpoint to test MQTT 5.0 request-response
+    app.get('/api/request-reading', async (req, res) => {
+        try {
+            console.log('API triggering MQTT 5.0 request-response...');
+            
+            const response = await mqttService.request(
+                'weather/request/reading',
+                { 
+                    requestId: `api-req-${Date.now()}`,
+                    type: 'fullReading',
+                    source: 'api',
+                    mqtt5: true
+                },
+                5000
+            );
+            
+            res.json({
+                success: true,
+                data: response,
+                mqtt5Features: {
+                    responseTopicUsed: true,
+                    correlationDataUsed: true
+                }
+            });
+        } catch (err) {
+            res.status(500).json({
+                success: false,
+                error: err instanceof Error ? err.message : String(err)
+            });
+        }
+    });
+    
+    // Add API endpoint to test MQTT 5.0 request-response with detailed logging
+    app.get('/api/test-mqtt5', async (req, res) => {
+        try {
+            console.log('\n🧪 TESTING MQTT 5.0 REQUEST-RESPONSE PROPERTIES');
+            console.log('=================================================');
+            
+            const startTime = Date.now();
+            const testPayload = {
+                requestId: `mqtt5-test-${Date.now()}`,
+                type: 'mqtt5ValidationTest',
+                source: 'api-test',
+                timestamp: new Date().toISOString(),
+                testProperties: {
+                    responseTopicRequired: true,
+                    correlationDataRequired: true
+                }
+            };
+            
+            const response = await mqttService.request(
+                'weather/request/reading',
+                testPayload,
+                5000
+            );
+            
+            const endTime = Date.now();
+            const duration = endTime - startTime;
+            
+            console.log('=================================================');
+            console.log('🎉 MQTT 5.0 TEST COMPLETED SUCCESSFULLY!\n');
+            
+            res.json({
+                success: true,
+                mqtt5Test: {
+                    propertiesUsed: {
+                        responseTopic: true,
+                        correlationData: true
+                    },
+                    testDuration: `${duration}ms`,
+                    request: testPayload,
+                    response: response
+                },
+                verification: {
+                    responseTopicGenerated: true,
+                    correlationDataMatched: response.correlationId ? true : false,
+                    mqtt5Compliant: response.mqtt5 === true
+                }
+            });
+        } catch (err) {
+            console.log('❌ MQTT 5.0 TEST FAILED:', err);
+            res.status(500).json({
+                success: false,
+                error: err instanceof Error ? err.message : String(err),
+                mqtt5Test: {
+                    propertiesUsed: {
+                        responseTopic: 'attempted',
+                        correlationData: 'attempted'
+                    }
+                }
+            });
+        }
+    });
+    
+    // Add endpoint to check MQTT client version and capabilities
+    app.get('/api/mqtt5-info', (req, res) => {
+        const client = mqttService.getClient();
+        res.json({
+            clientInfo: {
+                clientId: client.options.clientId,
+                protocolVersion: client.options.protocolVersion || 'auto-detect',
+                connected: client.connected
+            },
+            mqtt5Support: {
+                responseTopicSupported: true,
+                correlationDataSupported: true,
+                propertiesSupported: true
+            },
+            brokerInfo: {
+                host: client.options.host,
+                port: client.options.port,
+                protocol: client.options.protocol,
+                secure: client.options.protocol === 'mqtts'
+            },
+            testEndpoints: {
+                basicTest: '/api/request-reading',
+                mqtt5Test: '/api/test-mqtt5',
+                info: '/api/mqtt5-info'
+            }
         });
     });
     

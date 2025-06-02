@@ -47,6 +47,7 @@ export class MqttService extends EventEmitter {
             keepalive: 60,
             reconnectPeriod: 5000,
             will: lwt,  // Last Will and Testament message
+            protocolVersion: 5, // Force MQTT 5.0
             // Add secure connection options if provided
             rejectUnauthorized: options.rejectUnauthorized,
             // Include certificates if provided
@@ -62,14 +63,20 @@ export class MqttService extends EventEmitter {
     }
       private setupListeners(): void {
         // Handle connection event
-        this.client.on('connect', () => {
+        this.client.on('connect', (connack) => {
             console.log('Connected to HiveMQ Cloud broker');
+            console.log('📋 Connection Details:');
+            console.log(`   🔌 Protocol Version: ${this.client.options.protocolVersion}`);
+            console.log(`   🆔 Client ID: ${this.client.options.clientId}`);
+            console.log(`   📦 Session Present: ${connack.sessionPresent}`);
+            console.log(`   ✅ MQTT 5.0 Support: ${this.client.options.protocolVersion === 5 ? 'YES' : 'NO'}`);
             
             // Publish an online status message with retain flag
             this.publish('weather/status', JSON.stringify({
                 status: 'online',
                 clientId: this.client.options.clientId,
-                timestamp: new Date().toISOString()
+                timestamp: new Date().toISOString(),
+                protocolVersion: this.client.options.protocolVersion
             }), { qos: 1, retain: true });
               // Subscribe to control topic for flow control
             this.subscribe('weather/control');
@@ -215,99 +222,177 @@ export class MqttService extends EventEmitter {
         this.processingQueue = false;
     }
     
-    // Implement request-response pattern
-    public async request(requestTopic: string, responseTopic: string, payload: any, timeout: number = 5000): Promise<any> {
+    // MQTT 5.0 Request-Response pattern using Response Topic and Correlation Data
+    public async request(requestTopic: string, payload: any, timeout: number = 5000): Promise<any> {
         return new Promise((resolve, reject) => {
-            // Generate a unique correlation ID
-            const correlationId = `req-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+            // Generate unique correlation data for MQTT 5.0
+            const correlationData = Buffer.from(`req-${Date.now()}-${Math.random().toString(16).substr(2, 8)}`);
             
-            // Add correlation ID to payload
-            const requestPayload = {
-                ...payload,
-                correlationId
-            };
+            // Create unique response topic for this request
+            const responseTopic = `${requestTopic}/response/${this.client.options.clientId}/${correlationData.toString('hex')}`;
+            
+            console.log(`🔵 MQTT 5.0 REQUEST INITIATED:`);
+            console.log(`   📤 Request Topic: ${requestTopic}`);
+            console.log(`   📨 Response Topic (Property 1): ${responseTopic}`);
+            console.log(`   🔗 Correlation Data (Property 2): ${correlationData.toString('hex')}`);
+            console.log(`   📋 Payload:`, payload);
             
             // Set up timeout
             const timeoutId = setTimeout(() => {
                 this.client.unsubscribe(responseTopic);
-                reject(new Error(`Request to ${requestTopic} timed out after ${timeout}ms`));
+                console.log(`❌ MQTT 5.0 REQUEST TIMEOUT after ${timeout}ms`);
+                reject(new Error(`Request timeout after ${timeout}ms`));
             }, timeout);
             
-            // Handle response
-            const messageHandler = (topic: string, message: Buffer) => {
-                try {
-                    const response = JSON.parse(message.toString());
-                    
-                    // Check if this is the response we're waiting for
-                    if (response.correlationId === correlationId) {
-                        // Clean up
-                        clearTimeout(timeoutId);
-                        this.client.unsubscribe(responseTopic);
-                        this.client.removeListener('message', messageHandler);
+            // Subscribe to response topic first
+            this.client.subscribe(responseTopic, { qos: 1 }, (err) => {
+                if (err) {
+                    clearTimeout(timeoutId);
+                    console.log(`❌ Failed to subscribe to response topic: ${err.message}`);
+                    reject(err);
+                    return;
+                }
+                
+                console.log(`✅ Subscribed to response topic: ${responseTopic}`);
+                
+                // Set up one-time response handler
+                const responseHandler = (topic: string, message: Buffer, packet: any) => {
+                    if (topic === responseTopic) {
+                        console.log(`🔵 MQTT 5.0 RESPONSE RECEIVED:`);
+                        console.log(`   📨 Response Topic: ${topic}`);
+                        console.log(`   📦 Packet Properties:`, packet.properties);
                         
-                        // Resolve with the response data
-                        resolve(response);
+                        // Verify correlation data matches (MQTT 5.0 feature)
+                        const receivedCorrelationData = packet.properties?.correlationData;
+                        
+                        if (receivedCorrelationData) {
+                            console.log(`   🔗 Received Correlation Data: ${receivedCorrelationData.toString('hex')}`);
+                            console.log(`   🔗 Expected Correlation Data: ${correlationData.toString('hex')}`);
+                            console.log(`   ✅ Correlation Data Match: ${receivedCorrelationData.equals(correlationData)}`);
+                            
+                            if (receivedCorrelationData.equals(correlationData)) {
+                                clearTimeout(timeoutId);
+                                this.client.removeListener('message', responseHandler);
+                                this.client.unsubscribe(responseTopic);
+                                
+                                try {
+                                    const response = JSON.parse(message.toString());
+                                    console.log(`   📋 Response Data:`, response);
+                                    console.log(`🟢 MQTT 5.0 REQUEST-RESPONSE SUCCESSFUL!`);
+                                    resolve(response);
+                                } catch (parseError) {
+                                    console.log(`❌ Invalid JSON response: ${parseError}`);
+                                    reject(new Error('Invalid JSON response'));
+                                }
+                            } else {
+                                console.log(`❌ Correlation Data mismatch - ignoring response`);
+                            }
+                        } else {
+                            console.log(`❌ No correlation data in response - not MQTT 5.0 compliant`);
+                        }
                     }
-                } catch (err) {
-                    console.error('Error parsing response:', err);
-                }
-            };
-            
-            // Subscribe to response topic
-            this.client.subscribe(responseTopic);
-            this.client.on('message', messageHandler);
-            
-            // Send the request
-            this.publish(requestTopic, JSON.stringify(requestPayload), { 
-                qos: 1,
-                properties: {
-                    responseTopic,
-                    correlationData: Buffer.from(correlationId),
-                    messageExpiryInterval: 30 // 30 seconds
-                }
+                };
+                
+                this.client.on('message', responseHandler);
+                
+                // Publish request with MQTT 5.0 properties
+                this.client.publish(requestTopic, JSON.stringify(payload), {
+                    qos: 1,
+                    properties: {
+                        responseTopic: responseTopic,           // Property 1: Response Topic
+                        correlationData: correlationData       // Property 2: Correlation Data
+                    }
+                }, (publishErr) => {
+                    if (publishErr) {
+                        clearTimeout(timeoutId);
+                        this.client.removeListener('message', responseHandler);
+                        this.client.unsubscribe(responseTopic);
+                        console.log(`❌ Failed to publish request: ${publishErr.message}`);
+                        reject(publishErr);
+                    } else {
+                        console.log(`✅ MQTT 5.0 request published successfully`);
+                    }
+                });
             });
         });
     }
     
-    // Handle a request (for implementing responders)
-    public onRequest(requestTopic: string, handler: (request: any) => Promise<any>): void {
+    // MQTT 5.0 Request handler - processes requests with Response Topic and Correlation Data
+    public onRequest(requestTopic: string, handler: (request: any, responseTopic: string, correlationData: Buffer) => Promise<any> | any): void {
+        console.log(`🔧 Setting up request handler for topic: ${requestTopic}`);
         this.subscribe(requestTopic, 1);
         
-        this.client.on('message', async (topic, message, packet) => {
+        // Create a unique handler identifier to avoid conflicts
+        const handlerName = `request-handler-${requestTopic}-${Date.now()}`;
+        
+        const requestHandler = async (topic: string, message: Buffer, packet: any) => {
             if (topic === requestTopic) {
-                try {
-                    // Parse the request
-                    const request = JSON.parse(message.toString());
+                console.log(`🔵 MQTT 5.0 REQUEST RECEIVED on ${topic}:`);
+                console.log(`   📦 Raw message:`, message.toString());
+                console.log(`   📦 Packet Properties:`, packet.properties);
+                
+                // Extract MQTT 5.0 properties
+                const responseTopic = packet.properties?.responseTopic;
+                const correlationData = packet.properties?.correlationData;
+                
+                console.log(`   📨 Response Topic (Property 1): ${responseTopic || 'MISSING'}`);
+                console.log(`   🔗 Correlation Data (Property 2): ${correlationData ? correlationData.toString('hex') : 'MISSING'}`);
+                
+                if (responseTopic && correlationData) {
+                    console.log(`✅ MQTT 5.0 properties present - processing request`);
                     
-                    // Get the response topic and correlation ID
-                    const responseTopic = packet.properties?.responseTopic?.toString();
-                    const correlationId = request.correlationId;
-                    
-                    if (responseTopic && correlationId) {
-                        try {
-                            // Process the request
-                            const result = await handler(request);
-                            
-                            // Send the response
-                            const response = {
-                                ...result,
-                                correlationId
-                            };
-                            
-                            this.publish(responseTopic, JSON.stringify(response), { qos: 1 });
-                        } catch (err) {
-                            // Send error response
-                            this.publish(responseTopic, JSON.stringify({
-                                error: err instanceof Error ? err.message : String(err),
-                                correlationId
-                            }), { qos: 1 });
-                        }
+                    try {
+                        const request = JSON.parse(message.toString());
+                        console.log(`   📋 Request Data:`, request);
+                        
+                        // Call handler
+                        console.log(`   🔄 Calling request handler...`);
+                        const response = await handler(request, responseTopic, correlationData);
+                        console.log(`   📋 Handler returned response:`, response);
+                        
+                        // Send response using MQTT 5.0 properties
+                        console.log(`   📤 Publishing response to: ${responseTopic}`);
+                        this.client.publish(responseTopic, JSON.stringify(response), {
+                            qos: 1,
+                            properties: {
+                                correlationData: correlationData  // Echo back correlation data
+                            }
+                        }, (publishErr) => {
+                            if (publishErr) {
+                                console.log(`❌ Failed to send response: ${publishErr.message}`);
+                            } else {
+                                console.log(`🟢 MQTT 5.0 response sent successfully`);
+                                console.log(`   📨 Response Topic: ${responseTopic}`);
+                                console.log(`   🔗 Correlation Data echoed: ${correlationData.toString('hex')}`);
+                            }
+                        });
+                    } catch (error) {
+                        console.error('❌ Error processing MQTT 5.0 request:', error);
+                        
+                        // Send error response
+                        this.client.publish(responseTopic, JSON.stringify({
+                            error: 'Request processing failed',
+                            message: error instanceof Error ? error.message : String(error),
+                            mqtt5Error: true
+                        }), {
+                            qos: 1,
+                            properties: {
+                                correlationData: correlationData
+                            }
+                        });
                     }
-                } catch (err) {
-                    console.error('Error handling request:', err);
+                } else {
+                    console.log(`❌ MQTT 5.0 properties missing - not a valid MQTT 5.0 request`);
+                    console.log(`   Missing: ${!responseTopic ? 'Response Topic' : ''} ${!correlationData ? 'Correlation Data' : ''}`);
                 }
             }
-        });
+        };
+        
+        // Store the handler reference to avoid duplicates
+        (this as any)[handlerName] = requestHandler;
+        this.client.on('message', requestHandler);
+        
+        console.log(`✅ Request handler registered for ${requestTopic}`);
     }
     
     // Disconnect from the broker

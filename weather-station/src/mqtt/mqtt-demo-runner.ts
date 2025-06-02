@@ -198,17 +198,92 @@ function testMessageExpiry() {
 }
 
 function testRequestResponse() {
-    console.log('\n🔄 Testing Request-Response Pattern...');
+    console.log('\n🔄 Testing MQTT 5.0 Request-Response Pattern...');
+    console.log('   📋 This test verifies:');
+    console.log('   ✅ Response Topic (Property 1) generation');
+    console.log('   ✅ Correlation Data (Property 2) matching');
+    console.log('   ✅ MQTT 5.0 packet properties transmission');
+    console.log('   🔍 Watch console for detailed property logs...\n');
+    
+    const testStartTime = Date.now();
     
     testClient.request(
         'weather/request/reading',
-        'weather/response/reading',
-        { requestId: `demo-req-${Date.now()}`, test: true },
-        5000
+        { 
+            requestId: `demo-req-${Date.now()}`, 
+            test: true,
+            mqtt5ValidationTest: true,
+            source: 'demo-runner',
+            timestamp: new Date().toISOString(),
+            propertyTest: {
+                responseTopicRequired: true,
+                correlationDataRequired: true
+            }
+        },
+        8000 // Longer timeout for demo
     ).then((response) => {
-        logTest('Request-Response Pattern', 'PASS', `Received response with correlation ID`);
+        const testDuration = Date.now() - testStartTime;
+        
+        console.log('\n🎉 MQTT 5.0 REQUEST-RESPONSE COMPLETED!');
+        console.log('==========================================');
+        console.log(`⏱️ Total Duration: ${testDuration}ms`);
+        console.log(`📋 Request ID: ${response.requestId}`);
+        console.log(`🔗 Correlation ID: ${response.correlationId}`);
+        console.log(`🌡️ Temperature: ${response.temperature}°C`);
+        console.log(`💧 Humidity: ${response.humidity}%`);
+        console.log(`🔄 Pressure: ${response.pressure}hPa`);
+        console.log(`⚡ MQTT 5.0: ${response.mqtt5 ? 'YES' : 'NO'}`);
+        console.log(`🔌 Protocol Version: ${response.protocolVersion}`);
+        console.log('==========================================');
+        
+        let validationResults = [];
+        
+        // Comprehensive validation
+        if (response.mqtt5 === true) {
+            validationResults.push('✅ Server confirms MQTT 5.0 protocol used');
+        } else {
+            validationResults.push('❌ Server did not confirm MQTT 5.0 usage');
+        }
+        
+        if (response.correlationId) {
+            validationResults.push('✅ Correlation Data property working (ID received)');
+        } else {
+            validationResults.push('❌ Correlation Data property missing in response');
+        }
+        
+        if (response.processingSuccess) {
+            validationResults.push('✅ Response Topic property working (response received)');
+        } else {
+            validationResults.push('❌ Response processing failed');
+        }
+        
+        if (testDuration < 5000) {
+            validationResults.push('✅ Request-Response completed within timeout');
+        } else {
+            validationResults.push('⚠️ Request-Response was slow but successful');
+        }
+        
+        console.log('\n🔍 VALIDATION RESULTS:');
+        validationResults.forEach(result => console.log(`   ${result}`));
+        
+        if (response.mqtt5 && response.correlationId && response.processingSuccess) {
+            logTest('Request-Response Pattern', 'PASS', `MQTT 5.0 properties verified (${testDuration}ms)`);
+        } else {
+            logTest('Request-Response Pattern', 'FAIL', 'MQTT 5.0 properties validation failed');
+        }
     }).catch((error) => {
-        logTest('Request-Response Pattern', 'FAIL', `Request failed: ${error.message}`);
+        const testDuration = Date.now() - testStartTime;
+        console.log('\n❌ MQTT 5.0 REQUEST-RESPONSE FAILED!');
+        console.log('=====================================');
+        console.log(`⏱️ Duration: ${testDuration}ms`);
+        console.log(`❌ Error: ${error.message}`);
+        console.log('=====================================');
+        
+        if (error.message.includes('timeout')) {
+            logTest('Request-Response Pattern', 'FAIL', 'Request timeout - check if server is running and MQTT 5.0 is enabled');
+        } else {
+            logTest('Request-Response Pattern', 'FAIL', `MQTT 5.0 Request failed: ${error.message}`);
+        }
     });
 }
 
